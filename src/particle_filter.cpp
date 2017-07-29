@@ -22,6 +22,17 @@
 using namespace std;
 
 const double epsilon = 1e-4;
+unsigned long long update_counter = 0;
+
+inline double sq(double x) { return x * x; }
+
+std::ostream& operator<< (std::ostream& os, Particle p) {
+	return os << "Particle{id=" << p.id
+						<< ", x=" << p.x
+						<< ", y=" << p.y
+						<< ", weight=" << p.weight
+						<< ", assocs=" << p.associations.size() << "}";
+}
 
 void ParticleFilter::init(double x, double y, double theta, double std[]) {
 	// TODO: Set the number of particles. Initialize all particles to first position (based on estimates of
@@ -35,7 +46,8 @@ void ParticleFilter::init(double x, double y, double theta, double std[]) {
 	std::normal_distribution<double> y_dist(y, std[1]);
 	std::normal_distribution<double> theta_dist(theta, std[2]);
 	
-	num_particles = 1000;
+	num_particles = 40;
+	weights.resize(num_particles);
 	
 	for (int i = 0; i < num_particles; i++) {
 		Particle p;
@@ -48,6 +60,11 @@ void ParticleFilter::init(double x, double y, double theta, double std[]) {
 		particles.push_back(p);
 	}
 	
+	// for (Particle &p : particles) {
+	//	std::cout << "initial particle " << p << std::endl;
+	// }
+	
+	is_initialized = true;
 }
 
 void ParticleFilter::prediction(double delta_t, double std_pos[], double velocity, double yaw_rate) {
@@ -63,22 +80,19 @@ void ParticleFilter::prediction(double delta_t, double std_pos[], double velocit
 	std::normal_distribution<double> y_dist(0, std_pos[1]);
 	std::normal_distribution<double> theta_dist(0, std_pos[2]);
 	
-	std::cout << "v: " << velocity << " yawr: " << yaw_rate << std::endl;
-	
 	for (Particle& p : particles) {
 		
 		if (fabs(yaw_rate) < epsilon) {
 			// yaw rate is practically 0
-			std::cout << "!!! yaw rate practically 0 !!!" << std::endl;
+			p.x += velocity * delta_t * cos(p.theta) + x_dist(rng);
+			p.y += velocity * delta_t * sin(p.theta) + y_dist(rng);
 		} else {
 			const double v_yr = velocity / yaw_rate;
 			const double theta2 = p.theta + yaw_rate * delta_t;
-			
 			// Use the bicycle motion model equations + add noise
 			p.x += v_yr * ( sin(theta2) - sin(p.theta) ) + x_dist(rng);
 			p.y += v_yr * ( cos(p.theta) - cos(theta2) ) + y_dist(rng);
-			
-			p.theta = theta2 + theta_dist(rng);
+			p.theta += yaw_rate * delta_t + theta_dist(rng);
 		}
 	}
 }
@@ -89,28 +103,37 @@ void ParticleFilter::dataAssociation(std::vector<LandmarkObs> predicted, std::ve
 	// NOTE: this method will NOT be called by the grading code. But you will probably find it useful to
 	//   implement this method and use it as a helper during the updateWeights phase.
 	
-	// predicted - landmark's relative coordinates for particle
+	// predicted - landmark coordinate
 	// observed  - lidar saw a landmark
+	
+	// std::cout << "Obs ";
 	
 	for (LandmarkObs &ob : observations) {
 		
-		LandmarkObs min_landmark;
-		double min_dist = 1e12;
+		LandmarkObs *min_landmark = nullptr;
+		double min_dist = INFINITY;
 		
 		// Find the closest predicted landmark
 		for (LandmarkObs &pr : predicted) {
 			double dx = pr.x - ob.x;
 			double dy = pr.y - ob.y;
 			double dist = sqrt(dx * dx + dy * dy);
-				
+			
 			if (dist < min_dist) {
-				min_landmark = pr;
+				min_landmark = &pr;
 				min_dist = dist;
 			}
 		}
 		
+		if (min_landmark == nullptr) {
+			ob.id = -1;
+		}
+		
 		// Use the closest predicted landmark's ID as the observation's ID
-		ob.id = min_landmark.id;
+		else {
+			// std::cout << "(" << ob.x << "," << ob.y << ") -> #" << min_landmark->id << " (" << min_landmark->x << "," << min_landmark->y << ") <> " << min_dist << std::endl;
+			ob.id = min_landmark->id;
+		}
 	}
 }
 
@@ -145,10 +168,95 @@ void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
 	//   and the following is a good resource for the actual equation to implement (look at equation
 	//   3.33
 	//   http://planning.cs.uiuc.edu/node99.html
-	
-	
+	// std::cout << "======\nUpdate #" << update_counter++ << "\n======" << std::endl;
+	// For each particle:
 	for (Particle &p : particles) {
+		std::vector<LandmarkObs> particle_obs;
+		
+		// std::cout << "Particle update: " << p.id << " (" << p.x << "," << p.y << ")" << std::endl;
+		
+		// 1. Transform all observations relative to the particle, to global space.
+		for (int i = 0; i < observations.size(); i++) {
+			LandmarkObs transformed_obs = transformLandmark(observations[i], p);
+			particle_obs.push_back(transformed_obs);
+		}
+		
+		// 2. Get a list of landmarks that is in sensor range for the car.
+		std::vector<LandmarkObs> predictions;
+		
+		// std::cout << "Landmarks in range: ";
+		
+		for (auto &landmark : map_landmarks.landmark_list) {
+			if ( fabs(landmark.x_f - p.x) <= sensor_range &&
+			     fabs(landmark.y_f - p.y) <= sensor_range) {
+				LandmarkObs lm;
+				lm.x = landmark.x_f;
+				lm.y = landmark.y_f;
+				lm.id = landmark.id_i;
+				
+				// std::cout << lm.id << "; ";
+				predictions.push_back(lm);
+			}
+		}
+		
+		// std::cout << std::endl;
+		
+		
+		// 2. Match each transformed observation to a landmark.
+		dataAssociation(predictions, particle_obs);
+		
+		
+		p.associations.clear();
+		p.sense_x.clear();
+		p.sense_y.clear();
+		
 		p.weight = 1;
+		
+		
+		// std::cout << "Landmarks matched: ";
+		
+		// 3. For each transformed observation:
+		for (LandmarkObs &ob : particle_obs) {
+			// Get its associated landmark
+			
+			// if observation doesn't find a particle
+			if (ob.id == -1) {
+				continue;
+			}
+			
+			auto landmark = map_landmarks.landmark_list[ob.id - 1];
+			
+			// std::cout << landmark.id_i - 1 << "/";
+			
+			// Tell the simulator transformed observation coords & ID for matching
+			p.associations.push_back(ob.id);
+			p.sense_x.push_back(ob.x);
+			p.sense_y.push_back(ob.y);
+			
+			// Landmark's x & y coordinates
+			double m_x = landmark.x_f;
+			double m_y = landmark.y_f;
+			
+			// Sigma X and Y
+			double s_x = std_landmark[0];
+			double s_y = std_landmark[1];
+			
+			// Observation's X and Y coordinates
+			double x = ob.x;
+			double y = ob.y;
+			
+			double pdf = (1./(2.*M_PI*s_x*s_y)) * exp(-( sq(m_x-x)/(2*sq(s_x)) + sq(m_y-y)/(2*sq(s_y)) ));
+			
+			p.weight *= pdf;
+			
+			// std::cout << pdf << "; ";
+		}
+		
+		// std::cout << std::endl;
+	}
+	
+	for (int i = 0; i < particles.size(); i++) {
+		weights[i] = particles[i].weight;
 	}
 }
 
@@ -161,12 +269,13 @@ void ParticleFilter::resample() {
 	
 	std::vector<Particle> particles_new;
 
-	for (int i = 0; i < 1000; i++) {
-		particles_new.push_back( particles[ particleDist(rng) ] );
+	for (int i = 0; i < num_particles; i++) {
+		Particle sampled = particles[particleDist(rng)];
+		particles_new.push_back( std::move(sampled) );
 	}
 	
 	particles.clear();
-	particles = particles_new;
+	particles = std::move(particles_new);
 }
 
 Particle ParticleFilter::SetAssociations(Particle particle, std::vector<int> associations, std::vector<double> sense_x, std::vector<double> sense_y)
